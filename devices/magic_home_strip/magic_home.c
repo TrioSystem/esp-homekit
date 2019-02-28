@@ -39,9 +39,7 @@
 #define GREEN_PWM_PIN 5
 #define BLUE_PWM_PIN 13
 #define WHITE_PWM_PIN 15
-//#define RED_PWM_PIN 5
-//#define GREEN_PWM_PIN 12
-//#define BLUE_PWM_PIN 13
+
 #define LED_RGB_SCALE 255       // this is the scaling factor used for color conversion
 
 #define DEVICE_MANUFACTURER "TrioSystem"
@@ -81,9 +79,9 @@ homekit_characteristic_t serial       = HOMEKIT_CHARACTERISTIC_(SERIAL_NUMBER, D
 homekit_characteristic_t model        = HOMEKIT_CHARACTERISTIC_(MODEL,         DEVICE_MODEL);
 homekit_characteristic_t revision     = HOMEKIT_CHARACTERISTIC_(FIRMWARE_REVISION,  FW_VERSION);
 
-
+#define DEG_TO_RAD(X) (M_PI*(X)/180)
 //http://blog.saikoled.com/post/44677718712/how-to-convert-from-hsi-to-rgb-white
-static void hsi2rgb(float h, float s, float i, rgb_color_t* rgb) {
+static void hsi2rgb(float h, float s, float i, rgb_color_t* rgbw) {
     int r, g, b;
 
     while (h < 0) { h += 360.0F; };     // cycle h around to 0-360 degrees
@@ -113,11 +111,52 @@ static void hsi2rgb(float h, float s, float i, rgb_color_t* rgb) {
         g = LED_RGB_SCALE * i / 3 * (1 - s);
     }
 
-    rgb->red = (uint8_t) r;
-    rgb->green = (uint8_t) g;
-    rgb->blue = (uint8_t) b;
+    rgbw->red = (uint8_t) r;
+    rgbw->green = (uint8_t) g;
+    rgbw->blue = (uint8_t) b;
+    rgbw->white = 0;
 }
 
+void hsi2rgbw(float h, float s, float i, rgb_color_t* rgbw) {
+    uint16_t r, g, b, w;
+    float cos_h, cos_1047_h;
+    //h = fmod(h,360); // cycle h around to 0-360 degrees
+    h = 3.14159*h/(float)180; // Convert to radians.
+    s /=(float)100; i/=(float)100; //from percentage to ratio
+    s = s>0?(s<1?s:1):0; // clamp s and i to interval [0,1]
+    i = i>0?(i<1?i:1):0;
+    i = i*sqrt(i); //shape intensity to have finer granularity near 0
+
+    if(h < 2.09439) {
+        cos_h = cos(h);
+        cos_1047_h = cos(1.047196667-h);
+        r = s*LED_RGB_SCALE*i/3*(1+cos_h/cos_1047_h);
+        g = s*LED_RGB_SCALE*i/3*(1+(1-cos_h/cos_1047_h));
+        b = 0;
+        w = LED_RGB_SCALE*(1-s)*i;
+    } else if(h < 4.188787) {
+        h = h - 2.09439;
+        cos_h = cos(h);
+        cos_1047_h = cos(1.047196667-h);
+        g = s*LED_RGB_SCALE*i/3*(1+cos_h/cos_1047_h);
+        b = s*LED_RGB_SCALE*i/3*(1+(1-cos_h/cos_1047_h));
+        r = 0;
+        w = LED_RGB_SCALE*(1-s)*i;
+    } else {
+        h = h - 4.188787;
+        cos_h = cos(h);
+        cos_1047_h = cos(1.047196667-h);
+        b = s*LED_RGB_SCALE*i/3*(1+cos_h/cos_1047_h);
+        r = s*LED_RGB_SCALE*i/3*(1+(1-cos_h/cos_1047_h));
+        g = 0;
+        w = LED_RGB_SCALE*(1-s)*i;
+    }
+
+    rgbw->red=r;
+    rgbw->green=g;
+    rgbw->blue=b;
+    rgbw->white=w;
+}
 void led_identify_task(void *_args) {
     printf("LED identify\n");
 
@@ -248,10 +287,11 @@ IRAM void multipwm_task(void *pvParameters) {
     const TickType_t xPeriod = pdMS_TO_TICKS(LPF_INTERVAL);
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
-    uint8_t pins[] = {RED_PWM_PIN, GREEN_PWM_PIN, BLUE_PWM_PIN};
+    uint8_t pins[] = {RED_PWM_PIN, GREEN_PWM_PIN, BLUE_PWM_PIN, WHITE_PWM_PIN};
 
     pwm_info_t pwm_info;
-    pwm_info.channels = 3;
+    pwm_info.channels = 3;  // for RGB
+    //pwm_info.channels = 4;  //for RGBW
 
     multipwm_init(&pwm_info);
     multipwm_set_freq(&pwm_info, 65535);
@@ -262,21 +302,29 @@ IRAM void multipwm_task(void *pvParameters) {
     while(1) {
         if (led_on) {
             // convert HSI to RGBW
+            //printf("h=%d,s=%d,b=%d => ",(int)led_hue,(int)led_saturation,(int)led_brightness);
+
             hsi2rgb(led_hue, led_saturation, led_brightness, &target_color);
+            //hsi2rgbw(led_hue, led_saturation, led_brightness, &target_color);
+
+            //printf("r=%d,g=%d,b=%d,w=%d\n",target_color.red, target_color.green, target_color.blue, target_color.white);
         } else {
             target_color.red = 0;
             target_color.green = 0;
             target_color.blue = 0;
+            target_color.white = 0;
         }
 
         current_color.red += ((target_color.red * 256) - current_color.red) >> LPF_SHIFT ;
         current_color.green += ((target_color.green * 256) - current_color.green) >> LPF_SHIFT ;
         current_color.blue += ((target_color.blue * 256) - current_color.blue) >> LPF_SHIFT ;
+        current_color.white += ((target_color.blue * 256) - current_color.blue) >> LPF_SHIFT ;
 
         multipwm_stop(&pwm_info);
         multipwm_set_duty(&pwm_info, 0, current_color.red);
         multipwm_set_duty(&pwm_info, 1, current_color.green);
         multipwm_set_duty(&pwm_info, 2, current_color.blue);
+        //multipwm_set_duty(&pwm_info, 3, current_color.white);
         multipwm_start(&pwm_info);
 
         vTaskDelayUntil(&xLastWakeTime, xPeriod);
