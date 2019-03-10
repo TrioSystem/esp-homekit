@@ -13,7 +13,7 @@
 
 #include <espressif/esp_common.h>
 #include <rboot-api.h>
-#include <udplogger.h>
+//#include <udplogger.h>
 
 
 
@@ -37,13 +37,44 @@
 #include "mjpwm.h"
 #include "ota-api.h"  // ota menue und trigger update
 
-void on_wifi_ready();
 
 #define DEVICE_MANUFACTURER "TrioSystem"
 #define DEVICE_NAME "TrioBulb"
-#define DEVICE_MODEL "Led RGBW"
+#define DEVICE_MODEL "MY90xx-RGBW"
 #define DEVICE_SERIAL "12345678"
-#define FW_VERSION "0.0.001"
+#define FW_VERSION "0.0.104"
+
+#define FADE_SPEED 15
+#define HSI_RGB_SCALE 4095  // this is the scaling factor used for hsi-to-rgb color conversion
+
+#define INITIAL_HUE 0
+#define INITIAL_SATURATION 0
+#define INITIAL_BRIGHTNESS 100
+#define INITIAL_ON true
+
+#define PIN_DI 				13
+#define PIN_DCKI 			15
+
+// Task handle used to suspend and resume the animate task (doesn't need to be always running!)
+TaskHandle_t animateTH;
+// Boolean flag that can be used to gracefully stop the animate task
+bool shouldQuitAnimationTask = false;
+
+void on_wifi_ready();
+//float hue,sat,bri;
+//bool on;
+
+float led_hue = 0;
+float led_sat = 0;
+float led_bri = 0;
+float hue = INITIAL_HUE;
+float sat = INITIAL_SATURATION;
+float bri = INITIAL_BRIGHTNESS;
+bool on = INITIAL_ON;
+
+const char* animateLightPCName = "animate_task";
+
+
 
 homekit_characteristic_t ota_trigger  = API_OTA_TRIGGER;
 homekit_characteristic_t name         = HOMEKIT_CHARACTERISTIC_(NAME, DEVICE_NAME);
@@ -68,26 +99,26 @@ void hsi2rgbw(float h, float s, float i, int* rgbw) {
     if(h < 2.09439) {
         cos_h = cos(h);
         cos_1047_h = cos(1.047196667-h);
-        r = s*4095*i/3*(1+cos_h/cos_1047_h);
-        g = s*4095*i/3*(1+(1-cos_h/cos_1047_h));
+        r = s*HSI_RGB_SCALE*i/3*(1+cos_h/cos_1047_h);
+        g = s*HSI_RGB_SCALE*i/3*(1+(1-cos_h/cos_1047_h));
         b = 0;
-        w = 4095*(1-s)*i;
+        w = HSI_RGB_SCALE*(1-s)*i;
     } else if(h < 4.188787) {
         h = h - 2.09439;
         cos_h = cos(h);
         cos_1047_h = cos(1.047196667-h);
-        g = s*4095*i/3*(1+cos_h/cos_1047_h);
-        b = s*4095*i/3*(1+(1-cos_h/cos_1047_h));
+        g = s*HSI_RGB_SCALE*i/3*(1+cos_h/cos_1047_h);
+        b = s*HSI_RGB_SCALE*i/3*(1+(1-cos_h/cos_1047_h));
         r = 0;
-        w = 4095*(1-s)*i;
+        w = HSI_RGB_SCALE*(1-s)*i;
     } else {
         h = h - 4.188787;
         cos_h = cos(h);
         cos_1047_h = cos(1.047196667-h);
-        b = s*4095*i/3*(1+cos_h/cos_1047_h);
-        r = s*4095*i/3*(1+(1-cos_h/cos_1047_h));
+        b = s*HSI_RGB_SCALE*i/3*(1+cos_h/cos_1047_h);
+        r = s*HSI_RGB_SCALE*i/3*(1+(1-cos_h/cos_1047_h));
         g = 0;
-        w = 4095*(1-s)*i;
+        w = HSI_RGB_SCALE*(1-s)*i;
     }
 
     rgbw[0]=r;
@@ -96,28 +127,103 @@ void hsi2rgbw(float h, float s, float i, int* rgbw) {
     rgbw[3]=w;
 }
 
-#define PIN_DI 				13
-#define PIN_DCKI 			15
-
-float hue,sat,bri;
-bool on;
 
 
+
+
+// Hard write a color
+void lightSETmjpwm(void) {
+    int rgbw[4];
+    //printf("initial h=%d,s=%d,b=%d\n",(int)hue,(int)sat,(int)bri);
+    //printf("h=%d,s=%d,b=%d => ",(int)led_hue,(int)led_sat,(int)led_bri);
+
+    hsi2rgbw(led_hue,led_sat,led_bri,rgbw);
+
+    //printf("r=%d,g=%d,b=%d,w=%d\n",rgbw[0],rgbw[1],rgbw[2],rgbw[3]);
+
+    mjpwm_send_duty(rgbw[0],rgbw[1],rgbw[2],rgbw[3]);
+}
 
 void lightSET(void) {
     int rgbw[4];
     if (on) {
-        UDPLGP("h=%d,s=%d,b=%d => ",(int)hue,(int)sat,(int)bri);
+        printf("h=%d,s=%d,b=%d => ",(int)led_hue,(int)led_sat,(int)led_bri);
 
         hsi2rgbw(hue,sat,bri,rgbw);
-        UDPLGP("r=%d,g=%d,b=%d,w=%d\n",rgbw[0],rgbw[1],rgbw[2],rgbw[3]);
+
+        printf("r=%d,g=%d,b=%d,w=%d\n",rgbw[0],rgbw[1],rgbw[2],rgbw[3]);
 
         mjpwm_send_duty(rgbw[0],rgbw[1],rgbw[2],rgbw[3]);
     } else {
-        UDPLGP("off\n");
+        printf("off\n");
         mjpwm_send_duty(     0,      0,      0,      0 );
     }
 }
+
+
+float step_rot(float num, float target, float max, float stepWidth) {
+    float distPlus = num < target ? target - num : (max - num + target);
+    float distMin = num > target ? num - target : (num + max - target);
+    if (distPlus < distMin) {
+        if (distPlus > stepWidth) {
+            float res = num + stepWidth;
+            return res > max ? res - max : res;
+        }
+    } else {
+        if (distMin > stepWidth) {
+	    float res = num - stepWidth;
+            return res < 0 ? res + max : res;
+        }
+    }
+    return target;
+}
+
+float step(float num, float target, float stepWidth) {
+    if (num < target) {
+        if (num < target - stepWidth) return num + stepWidth;
+	return target;
+    } else if (num > target) {
+        if (num > target + stepWidth) return num - stepWidth;
+	return target;
+    }
+
+    return target;
+}
+
+
+void animate_light_transition_task(void* pvParameters) {
+    //struct Color rgb;
+    //int rgbw[4];
+    float t_b;
+
+    while (!shouldQuitAnimationTask) {
+	// Compute brightness target value
+	if (on) t_b = bri;
+	else t_b = 0;
+
+	// Do the transition
+	while (!(hue == led_hue
+	    	&& sat == led_sat
+	   	&& t_b == led_bri)) {
+
+	    // Update led values according to target
+	    led_hue = step_rot(led_hue, hue, 360, 3.6);
+	    led_sat = step(led_sat, sat, 1.0);
+	    led_bri = step(led_bri, t_b, 1.0);
+
+	    lightSETmjpwm();
+
+	    // Only do this at most 60 times per second
+	    vTaskDelay(FADE_SPEED / portTICK_PERIOD_MS);
+	}
+
+	vTaskSuspend(animateTH);
+    }
+
+
+    vTaskDelete(NULL);
+}
+
 
 void light_init() {
     mjpwm_cmd_t init_cmd = {
@@ -130,7 +236,7 @@ void light_init() {
     };
     mjpwm_init(PIN_DI, PIN_DCKI, 1, init_cmd);
     on=true; hue=0; sat=0; bri=100; //this should not be here, but part of the homekit init work
-    lightSET();
+    //lightSET();
 }
 
 
@@ -139,11 +245,12 @@ homekit_value_t light_on_get() {
 }
 void light_on_set(homekit_value_t value) {
     if (value.format != homekit_format_bool) {
-        UDPLGP("Invalid on-value format: %d\n", value.format);
+        printf("Invalid on-value format: %d\n", value.format);
         return;
     }
     on = value.bool_value;
-    lightSET();
+    //lightSET();
+    vTaskResume(animateTH);
 }
 
 homekit_value_t light_bri_get() {
@@ -151,11 +258,12 @@ homekit_value_t light_bri_get() {
 }
 void light_bri_set(homekit_value_t value) {
     if (value.format != homekit_format_int) {
-        UDPLGP("Invalid bri-value format: %d\n", value.format);
+        printf("Invalid bri-value format: %d\n", value.format);
         return;
     }
     bri = value.int_value;
-    lightSET();
+    //lightSET();
+    vTaskResume(animateTH);
 }
 
 homekit_value_t light_hue_get() {
@@ -163,11 +271,12 @@ homekit_value_t light_hue_get() {
 }
 void light_hue_set(homekit_value_t value) {
     if (value.format != homekit_format_float) {
-        UDPLGP("Invalid hue-value format: %d\n", value.format);
+        printf("Invalid hue-value format: %d\n", value.format);
         return;
     }
     hue = value.float_value;
-    lightSET();
+    //lightSET();
+    vTaskResume(animateTH);
 }
 
 homekit_value_t light_sat_get() {
@@ -175,11 +284,12 @@ homekit_value_t light_sat_get() {
 }
 void light_sat_set(homekit_value_t value) {
     if (value.format != homekit_format_float) {
-        UDPLGP("Invalid sat-value format: %d\n", value.format);
+        printf("Invalid sat-value format: %d\n", value.format);
         return;
     }
     sat = value.float_value;
-    lightSET();
+    //lightSET();
+    vTaskResume(animateTH);
 }
 
 
@@ -193,12 +303,13 @@ void light_identify_task(void *_args) {
         vTaskDelay(300 / portTICK_PERIOD_MS); //0.3 sec
     }
     lightSET();
+    //vTaskResume(animateTH);
 
     vTaskDelete(NULL);
 }
 
 void light_identify(homekit_value_t _value) {
-    UDPLGP("Light Identify\n");
+    printf("Light Identify\n");
     xTaskCreate(light_identify_task, "Light identify", 256, NULL, 2, NULL);
 }
 
@@ -219,6 +330,7 @@ homekit_accessory_t *accessories[] = {
                 }),
             HOMEKIT_SERVICE(LIGHTBULB, .primary=true,
                 .characteristics=(homekit_characteristic_t*[]){
+                    //HOMEKIT_CHARACTERISTIC(NAME, DEVICE_NAME),
                     HOMEKIT_CHARACTERISTIC(
                         ON, true,
                         .getter=light_on_get,
@@ -250,8 +362,9 @@ homekit_accessory_t *accessories[] = {
 homekit_server_config_t config = {
     .accessories = accessories,
     .password = "123-45-678",
-    .setupId="1QJ8",
+    //.setupId="1QJ8",
 };
+
 
 void create_accessory_name() {
     uint8_t macaddr[6];
@@ -260,12 +373,8 @@ void create_accessory_name() {
     char *name_value = malloc(17);
     //snprintf(name_value, 17, "TrioSysems %02X%02X%02X", macaddr[3], macaddr[4], macaddr[5]);
 	//snprintf(name_value, 17, "%s-%s-%02X%02X%02X", DEVICE_NAME, DEVICE_MODEL, macaddr[3], macaddr[4], macaddr[5]);
-    snprintf(name_value, 17, "%s-%02X%02X%02X", DEVICE_NAME, macaddr[3], macaddr[4], macaddr[5]);
-
+    snprintf(name_value, 17, "%s %02X%02X%02X", DEVICE_NAME, macaddr[3], macaddr[4], macaddr[5]);
     name.value = HOMEKIT_STRING(name_value);
-
-
-
 
     char *serial_value = malloc(13);
     snprintf(serial_value, 13, "%02X%02X%02X%02X%02X%02X", macaddr[0], macaddr[1], macaddr[2], macaddr[3], macaddr[4], macaddr[5]);
@@ -273,20 +382,22 @@ void create_accessory_name() {
 }
 
 void on_wifi_ready() {
-    xTaskCreate(udplog_send, "logsend", 256, NULL, 2, NULL);
-    light_init();
+    printf("WiFi ready\n");
+
     homekit_server_init(&config);
 }
 
 void user_init(void) {
-    UDPLGP("\n\n\n\n\n\n\nuser-init-start\n");
-
-//    uart_set_baud(0, 74880);
+    //    uart_set_baud(0, 74880);
     uart_set_baud(0, 115200);
+    printf("\n\n\n\n\n\n\nuser-init-start\n");
+    light_init();
 
     create_accessory_name();
-    wifi_config_init("TrioBulb", NULL, on_wifi_ready);
+    wifi_config_init(DEVICE_NAME, NULL, on_wifi_ready);
 
-    UDPLGP("user-init-done\n");
+    // Task for animating the led transition
+    xTaskCreate(animate_light_transition_task, animateLightPCName, 1024, NULL, 1, &animateTH);
 
+    printf("user-init-done\n");
 }
