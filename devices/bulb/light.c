@@ -42,7 +42,7 @@
 #define DEVICE_NAME "TrioBulb"
 #define DEVICE_MODEL "MY90xx-RGBW"
 #define DEVICE_SERIAL "12345678"
-#define FW_VERSION "0.0.104"
+#define FW_VERSION "0.0.105"
 
 #define FADE_SPEED 15
 #define HSI_RGB_SCALE 4095  // this is the scaling factor used for hsi-to-rgb color conversion
